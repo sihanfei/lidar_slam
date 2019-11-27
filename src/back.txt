@@ -1,0 +1,181 @@
+  void removeGroundbyRay()
+  {
+    size_t current_index_, pre_index_;
+    float angle_;
+    PointType current_point_, pre_point_;
+    int8_t ground_seg_rowID_mat_[Horizon_SCAN];  // 用于保存每列中最后一个地面点的行序号
+    for (size_t j = 0; j < Horizon_SCAN; ++j)
+    {
+      ground_seg_rowID_mat_[j] = -1;
+    }
+
+    for (size_t j = 0; j < Horizon_SCAN; ++j)
+    {
+      for (int8_t i = 0; i < groundScanInd; ++i)  // 按列计算
+      {
+        current_index_ = j + i * Horizon_SCAN;
+        current_point_ = fullCloud->points[current_index_];
+        if (current_point_.intensity == -1)  // 当前是一个无效点
+        {
+          groundMat.at<int8_t>(i, j) = -1;  // 无效点
+        }
+        else  // 当前点有效
+        {
+          if (i == 0)  // 第一行
+          {
+            angle_ = atan2f(current_point_.z - (-mount_height),
+                            sqrt(pow(current_point_.x - 0, 2) + pow(current_point_.y - 0, 2)));
+            if (angle_ - mount_angle < ground_angle_threshold)  // 阈值内
+            {
+              groundMat.at<int8_t>(i, j) = 1;
+              ground_seg_rowID_mat_[j] = i;
+              groundCloud->push_back(current_point_);
+            }
+            else
+            {
+              groundMat.at<int8_t>(i, j) = 0;
+            }
+          }
+          else  // i>0
+          {
+            pre_index_ = j + (i - 1) * Horizon_SCAN;
+            pre_point_ = fullCloud->points[pre_index_];
+            if (groundMat.at<int8_t>(i - 1, j) == 1)  // 前一点为地面点
+            {
+              if (rangeMat.at<float>(i, j) <= rangeMat.at<float>(i - 1, j))  // 当前点range更短,则为非地面点
+              {
+                groundMat.at<int8_t>(i, j) = 0;
+              }
+              else
+              {
+                angle_ = atan2f(current_point_.z - pre_point_.z, sqrt(pow(current_point_.x - pre_point_.x, 2) +
+                                                                      pow(current_point_.y - pre_point_.y, 2)));
+                if (angle_ - mount_angle < ground_angle_threshold)  // 阈值内
+                {
+                  groundMat.at<int8_t>(i, j) = 1;
+                  ground_seg_rowID_mat_[j] = i;
+                  groundCloud->push_back(current_point_);
+                }
+                else
+                {
+                  groundMat.at<int8_t>(i, j) = 0;
+                }
+              }
+            }
+            else  // 前一点为非地面点或者无效点
+            {
+              if (ground_seg_rowID_mat_[j] != -1)  // 之前存在地面点
+              {
+                PointType seg_point_ =
+                    fullCloud->points[j + ground_seg_rowID_mat_[j] * Horizon_SCAN];  // 获取最后一个地面点数据
+                if (current_point_.z - seg_point_.z < ground_height_threshold)       // 高差在阈值内
+                {
+                  groundMat.at<int8_t>(i, j) = 1;
+                  ground_seg_rowID_mat_[j] = i;
+                  groundCloud->push_back(current_point_);
+                }
+                else
+                {
+                  groundMat.at<int8_t>(i, j) = 0;
+                }
+              }
+              else
+              {
+                if (current_point_.z - (-mount_height) < ground_height_threshold)  // 高差在阈值内
+                {
+                  groundMat.at<int8_t>(i, j) = 1;
+                  ground_seg_rowID_mat_[j] = i;
+                  groundCloud->push_back(current_point_);
+                }
+                else
+                {
+                  groundMat.at<int8_t>(i, j) = 0;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    ROS_INFO("\033[1;32m---->\033[0m groundCloud size = %ld.", groundCloud->points.size());
+  }
+
+
+
+  void removeGroundbyRay()
+  {
+    size_t current_index_, seg_index_, seg_rowID_;
+    float angle_;
+    PointType current_point_, seg_point_;
+    int8_t ground_seg_rowID_mat_[Horizon_SCAN];  // 用于保存每列中最后一个地面点的行序号
+    for (size_t j = 0; j < Horizon_SCAN; ++j)
+    {
+      ground_seg_rowID_mat_[j] = -1;
+    }
+
+    for (size_t j = 0; j < Horizon_SCAN; ++j)
+    {
+      for (int8_t i = 0; i < groundScanInd; ++i)  // 按列计算
+      {
+        current_index_ = j + i * Horizon_SCAN;
+        current_point_ = fullCloud->points[current_index_];
+        if (current_point_.intensity == -1)  // 无效点
+        {
+          groundMat.at<int8_t>(i, j) = -1;
+          ground_seg_rowID_mat_[j] = -1;
+        }
+        else  // 当前点有效
+        {
+          if (ground_seg_rowID_mat_[j] == -1)  // 无地面点
+          {
+            if (current_point_.z - (-mount_height) < ground_height_threshold)  // 高度在阈值范围内
+            {
+              groundMat.at<int8_t>(i, j) = 1;
+              ground_seg_rowID_mat_[j] = i;
+              groundCloud->push_back(current_point_);
+            }
+            else
+            {
+              groundMat.at<int8_t>(i, j) = 0;
+            }
+          }
+          else  // 有地面点
+          {
+            seg_rowID_ = ground_seg_rowID_mat_[j];
+            seg_index_ = j + seg_rowID_ * Horizon_SCAN;
+            seg_point_ = fullCloud->points[seg_index_];
+            if (rangeMat.at<float>(i, j) <= rangeMat.at<float>(seg_rowID_, j) ||
+                current_point_.z - seg_point_.z > ground_height_threshold)  // 当前点range更短,或者z高度差超过阈值
+            {
+              groundMat.at<int8_t>(i, j) = 0;
+            }
+            else  // z高度差在阈值内,且range更长
+            {
+              if (i - seg_rowID_ > 1)  // 不是连续点,则只需要考虑高度差
+              {
+                groundMat.at<int8_t>(i, j) = 1;
+                ground_seg_rowID_mat_[j] = i;
+                groundCloud->push_back(current_point_);
+              }
+              else  // 连续点则判断角度
+              {
+                angle_ = atan2f(current_point_.z - seg_point_.z, sqrtf(powf(current_point_.y - seg_point_.y, 2) +
+                                                                       powf(current_point_.x - seg_point_.x, 2)));
+                if (angle_ > ground_angle_threshold)
+                {
+                  groundMat.at<int8_t>(i, j) = 0;
+                }
+                else
+                {
+                  groundMat.at<int8_t>(i, j) = 1;
+                  ground_seg_rowID_mat_[j] = i;
+                  groundCloud->push_back(current_point_);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    ROS_INFO("\033[1;32m---->\033[0m groundCloud size = %ld.", groundCloud->points.size());
+  }
