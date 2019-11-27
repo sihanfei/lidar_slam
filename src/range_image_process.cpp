@@ -1,5 +1,129 @@
 #include "../include/utility.h"
 
+/*
+//////////////////////////////////////////////////////////////////////////
+*/
+// 重写pcl的库函数,自适应不同半径下的欧式距离
+void extractAutoEuclideanClusters(const pcl::PointCloud<PointType> &cloud,
+                                  const pcl::search::Search<PointType>::Ptr &tree, float tolerance,
+                                  pcl::IndicesClusters &clusters, unsigned int min_pts_per_cluster,
+                                  unsigned int max_pts_per_cluster)
+{
+  if (tree->getInputCloud()->points.size() != cloud.points.size())
+  {
+    PCL_ERROR("[pcl::extractEuclideanClusters] Tree built for a different point cloud dataset (%lu) than the input "
+              "cloud (%lu)!\n",
+              tree->getInputCloud()->points.size(), cloud.points.size());
+    return;
+  }
+  // Check if the tree is sorted -- if it is we don't need to check the first element
+  int nn_start_idx = tree->getSortedResults() ? 1 : 0;
+  // Create a bool vector of processed point indices, and initialize it to false
+  std::vector<bool> processed(cloud.points.size(), false);
+
+  std::vector<int> nn_indices;
+  std::vector<float> nn_distances;
+
+  float radius_ = 0;           // point在xy平面上的半径
+  float lidar_resolution_ = 0; // lidar在对应半径上的分辨率
+  float point_tolerance_ = 0;  // 分类的欧式距离
+  // Process all points in the indices vector
+  for (int i = 0; i < static_cast<int>(cloud.points.size()); ++i)
+  {
+    if (processed[i])
+      continue;
+
+    radius_ = sqrtf(cloud.points[i].x * cloud.points[i].x + cloud.points[i].y * cloud.points[i].y);
+    lidar_resolution_ = radius_ * ang_res_x * M_PI / 180 /
+                        (sinf(segmentTheta)); // 考虑并非垂直liar光束情况,将等效宽度与分割角度结合起来
+    // 在两个里面取较小的值,这样在近距离的时候,主要以lidar分辨率为主；在远距离的时候,以固定的要求为主.
+    // 主要避免因为远距离上lidar分辨率过大,导致两个物体被合并到一起.
+    point_tolerance_ = std::min(lidar_resolution_, tolerance);
+
+    std::vector<int> seed_queue;
+    int sq_idx = 0;
+    seed_queue.push_back(i);
+
+    processed[i] = true;
+
+    while (sq_idx < static_cast<int>(seed_queue.size()))
+    {
+      // Search for sq_idx
+      if (!tree->radiusSearch(seed_queue[sq_idx], point_tolerance_, nn_indices, nn_distances))
+      {
+        sq_idx++;
+        continue;
+      }
+
+      for (size_t j = nn_start_idx; j < nn_indices.size(); ++j) // can't assume sorted (default isn't!)
+      {
+        if (nn_indices[j] == -1 || processed[nn_indices[j]]) // Has this point been processed before ?
+          continue;
+
+        // Perform a simple Euclidean clustering
+        seed_queue.push_back(nn_indices[j]);
+        processed[nn_indices[j]] = true;
+      }
+
+      sq_idx++;
+    }
+
+    // If this queue is satisfactory, add to the clusters
+    if (seed_queue.size() >= min_pts_per_cluster && seed_queue.size() <= max_pts_per_cluster)
+    {
+      pcl::PointIndices r;
+      r.indices.resize(seed_queue.size());
+      for (size_t j = 0; j < seed_queue.size(); ++j)
+        r.indices[j] = seed_queue[j];
+
+      // These two lines should not be needed: (can anyone confirm?) -FF
+      std::sort(r.indices.begin(), r.indices.end());
+      r.indices.erase(std::unique(r.indices.begin(), r.indices.end()), r.indices.end());
+
+      r.header = cloud.header;
+      clusters.push_back(r); // We could avoid a copy by working directly in the vector
+    }
+  }
+}
+
+// 继承欧式聚类
+class AutoEuclideanClusterExtraction : public pcl::EuclideanClusterExtraction<PointType>
+{
+private:
+public:
+  void extract(pcl::IndicesClusters &clusters)
+  {
+    if (!initCompute() || (input_ != 0 && input_->points.empty()) || (indices_ != 0 && indices_->empty()))
+    {
+      clusters.clear();
+      return;
+    }
+
+    // Initialize the spatial locator
+    if (!tree_)
+    {
+      if (input_->isOrganized())
+        tree_.reset(new pcl::search::OrganizedNeighbor<PointType>());
+      else
+        tree_.reset(new pcl::search::KdTree<PointType>(false));
+    }
+
+    // Send the input dataset to the spatial locator
+    tree_->setInputCloud(input_, indices_);
+    extractAutoEuclideanClusters(*input_, tree_, static_cast<float>(cluster_tolerance_), clusters, min_pts_per_cluster_,
+                                 max_pts_per_cluster_);
+
+    // tree_->setInputCloud(input_);
+    // extractEuclideanClusters(*input_, tree_, cluster_tolerance_, clusters, min_pts_per_cluster_,
+    // max_pts_per_cluster_);
+
+    // Sort the clusters based on their size (largest one first)
+    std::sort(clusters.rbegin(), clusters.rend(), pcl::comparePointClusters);
+
+    deinitCompute();
+  }
+};
+
 class RangeImageProcess
 {
 private:
@@ -12,27 +136,27 @@ private:
   ros::Publisher pubSegmentedCloud;
   ros::Publisher pubSegmentedCloudPure;
 
-  pcl::PointCloud<PointType>::Ptr laserCloudIn;        // 原始点云
-  pcl::PointCloud<PointType>::Ptr fullCloud;           // 将全部点云有序排列成 N_SCAN * Horizon_SCAN
-  pcl::PointCloud<PointType>::Ptr groundCloud;         // 地面点云
-  pcl::PointCloud<PointType>::Ptr segmentedCloud;      // 无地面点云,准备用于聚类
-  pcl::PointCloud<PointType>::Ptr segmentedCloudPure;  // 聚类完成点云
+  pcl::PointCloud<PointType>::Ptr laserCloudIn;       // 原始点云
+  pcl::PointCloud<PointType>::Ptr fullCloud;          // 将全部点云有序排列成 N_SCAN * Horizon_SCAN
+  pcl::PointCloud<PointType>::Ptr groundCloud;        // 地面点云
+  pcl::PointCloud<PointType>::Ptr segmentedCloud;     // 无地面点云,准备用于聚类
+  pcl::PointCloud<PointType>::Ptr segmentedCloudPure; // 聚类完成点云
+  pcl::IndicesClusters cluster_indices;
+  PointType nanPoint; // fill in fullCloud at each iteration
 
-  PointType nanPoint;  // fill in fullCloud at each iteration
-
-  cv::Mat rangeMat;   // range matrix for range image
-  cv::Mat groundMat;  // 用于标记地面点 -1 无效 0 非地面点 1 地面点
-  cv::Mat objectMat;  // 目标物标记
+  cv::Mat rangeMat;  // range matrix for range image
+  cv::Mat groundMat; // 用于标记地面点 -1 无效 0 非地面点 1 地面点
+  cv::Mat objectMat; // 目标物标记
   int objectCount;
 
-  std::vector<pcl::PointCloud<PointType>> segMsg;  // 各个目标点云序列
+  std::vector<pcl::PointCloud<PointType>> segMsg; // 各个目标点云序列
 
-  std::vector<std::pair<uint8_t, uint8_t>> neighborIterator;  // neighbor iterator for segmentaiton process
+  std::vector<std::pair<uint8_t, uint8_t>> neighborIterator; // neighbor iterator for segmentaiton process
 
-  uint16_t *allPushedIndX;  // array for tracking points of a segmented object
+  uint16_t *allPushedIndX; // array for tracking points of a segmented object
   uint16_t *allPushedIndY;
 
-  uint16_t *queueIndX;  // array for breadth-first search process of segmentation
+  uint16_t *queueIndX; // array for breadth-first search process of segmentation
   uint16_t *queueIndY;
 
   std_msgs::Header cloudHeader;
@@ -94,10 +218,11 @@ public:
     groundCloud->clear();
     segmentedCloud->clear();
     segmentedCloudPure->clear();
+    cluster_indices.clear();
 
     rangeMat = cv::Mat(N_SCAN, Horizon_SCAN, CV_32F, cv::Scalar::all(FLT_MAX));
     groundMat = cv::Mat(N_SCAN, Horizon_SCAN, CV_8S, cv::Scalar::all(0));  // 清空数据 -1:无效 0:初始值 1:地面点
-    objectMat = cv::Mat(N_SCAN, Horizon_SCAN, CV_32S, cv::Scalar::all(0));  // 0:非地面 n:目标id
+    objectMat = cv::Mat(N_SCAN, Horizon_SCAN, CV_32S, cv::Scalar::all(0)); // 0:非地面 n:目标id
 
     objectCount = 1;
 
@@ -142,7 +267,7 @@ public:
       // 计算行号
       verti_angle_ =
           atan2f(this_point_.z, sqrt(this_point_.x * this_point_.x + this_point_.y * this_point_.y)) * 180 / M_PI;
-      verti_angle_ += offset_ang_y;  // 转换为0~11度
+      verti_angle_ += offset_ang_y; // 转换为0~11度
       rowIDn_ = verti_angle_ / ang_res_y;
       if (rowIDn_ < 0 || rowIDn_ >= N_SCAN)
       {
@@ -153,9 +278,9 @@ public:
       horizon_angle_ = atan2f(this_point_.y, this_point_.x) * 180 / M_PI;
       if (horizon_angle_ < 0)
       {
-        horizon_angle_ += 360;  // 转换到0~360度
+        horizon_angle_ += 360; // 转换到0~360度
       }
-      horizon_angle_ += offset_ang_x;  // 从120~240 转换到 0~120
+      horizon_angle_ += offset_ang_x; // 从120~240 转换到 0~120
       columnIDn_ = horizon_angle_ / ang_res_x;
       if (columnIDn_ < 0 || columnIDn_ >= Horizon_SCAN)
       {
@@ -169,7 +294,7 @@ public:
       // pointMat[rowIDn_][columnIDn_].intensity = range_;
 
       // 按行存储
-      fullCloud->points[columnIDn_ + rowIDn_ * Horizon_SCAN] = this_point_;  // 按照行排布
+      fullCloud->points[columnIDn_ + rowIDn_ * Horizon_SCAN] = this_point_; // 按照行排布
       rangeMat.at<float>(rowIDn_, columnIDn_) = range_;
     }
   }
@@ -198,7 +323,7 @@ public:
         }
         else
         {
-          groundMat.at<int8_t>(i, j) = -1;  // 无效点
+          groundMat.at<int8_t>(i, j) = -1; // 无效点
         }
       }
     }
@@ -206,7 +331,7 @@ public:
     {
       for (size_t j = 0; j < Horizon_SCAN; ++j)
       {
-        if (groundMat.at<int8_t>(i, j) == 1 || rangeMat.at<float>(i, j) == FLT_MAX)  // 地面点或者无效点
+        if (groundMat.at<int8_t>(i, j) == 1 || rangeMat.at<float>(i, j) == FLT_MAX) // 地面点或者无效点
         {
           objectMat.at<int>(i, j) = -1;
         }
@@ -242,7 +367,7 @@ public:
     size_t current_index_, seg_index_, seg_rowID_;
     float angle_;
     PointType current_point_, seg_point_;
-    int8_t ground_seg_rowID_mat_[Horizon_SCAN];  // 用于保存每列中最后一个地面点的行序号
+    int8_t ground_seg_rowID_mat_[Horizon_SCAN]; // 用于保存每列中最后一个地面点的行序号
     for (size_t j = 0; j < Horizon_SCAN; ++j)
     {
       ground_seg_rowID_mat_[j] = -1;
@@ -250,20 +375,20 @@ public:
 
     for (size_t j = 0; j < Horizon_SCAN; ++j)
     {
-      for (int8_t i = 0; i < groundScanInd; ++i)  // 按列计算
+      for (int8_t i = 0; i < groundScanInd; ++i) // 按列计算
       {
         current_index_ = j + i * Horizon_SCAN;
         current_point_ = fullCloud->points[current_index_];
-        if (current_point_.intensity == -1)  // 无效点
+        if (current_point_.intensity == -1) // 无效点
         {
           groundMat.at<int8_t>(i, j) = -1;
           ground_seg_rowID_mat_[j] = -1;
         }
-        else  // 当前点有效
+        else // 当前点有效
         {
-          if (ground_seg_rowID_mat_[j] == -1)  // 无地面点
+          if (ground_seg_rowID_mat_[j] == -1) // 无地面点
           {
-            if (i == 0)  // 当前是第一点
+            if (i == 0) // 当前是第一点
             {
               angle_ = atan2f(current_point_.z - seg_point_.z, sqrtf(powf(current_point_.y - seg_point_.y, 2) +
                                                                      powf(current_point_.x - seg_point_.x, 2))) *
@@ -281,7 +406,7 @@ public:
             }
             else
             {
-              if (current_point_.z - (-mount_height) < ground_height_threshold)  // 高度在阈值范围内
+              if (current_point_.z - (-mount_height) < ground_height_threshold) // 高度在阈值范围内
               {
                 groundMat.at<int8_t>(i, j) = 1;
                 ground_seg_rowID_mat_[j] = i;
@@ -293,25 +418,25 @@ public:
               }
             }
           }
-          else  // 有地面点
+          else // 有地面点
           {
             seg_rowID_ = ground_seg_rowID_mat_[j];
             seg_index_ = j + seg_rowID_ * Horizon_SCAN;
             seg_point_ = fullCloud->points[seg_index_];
             if (rangeMat.at<float>(i, j) <= rangeMat.at<float>(seg_rowID_, j) ||
-                current_point_.z - seg_point_.z > ground_height_threshold)  // 当前点range更短,或者z高度差超过阈值
+                current_point_.z - seg_point_.z > ground_height_threshold) // 当前点range更短,或者z高度差超过阈值
             {
               groundMat.at<int8_t>(i, j) = 0;
             }
-            else  // z高度差在阈值内,且range更长
+            else // z高度差在阈值内,且range更长
             {
-              if (i - seg_rowID_ > 1)  // 不是连续点,则只需要考虑高度差
+              if (i - seg_rowID_ > 1) // 不是连续点,则只需要考虑高度差
               {
                 groundMat.at<int8_t>(i, j) = 1;
                 ground_seg_rowID_mat_[j] = i;
                 groundCloud->push_back(current_point_);
               }
-              else  // 连续点则判断角度
+              else // 连续点则判断角度
               {
                 angle_ = atan2f(current_point_.z - seg_point_.z, sqrtf(powf(current_point_.y - seg_point_.y, 2) +
                                                                        powf(current_point_.x - seg_point_.x, 2))) *
@@ -389,7 +514,7 @@ public:
   void cloudHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudMsg)
   {
     // 1. Convert ros message to pcl point cloud
-    copyPointCloud(laserCloudMsg);  // done
+    copyPointCloud(laserCloudMsg); // done
     // 2. Start and end angle of a scan
     // // 3. Range image projection
     projectPointCloud();
@@ -404,21 +529,51 @@ public:
     resetParameters();
   }
 
+  void cloudSegmentationWithEu()
+  {
+    pcl::search::Search<PointType>::Ptr tree_ec(new pcl::search::KdTree<PointType>);
+    tree_ec->setInputCloud(laserCloudIn);
+
+    // AutoEuclideanClusterExtraction ec;
+    pcl::EuclideanClusterExtraction<PointType> ec;
+    ec.setInputCloud(laserCloudIn);
+    ec.setClusterTolerance(segmentDistance); // 默认两点的最小值
+    ec.setMaxClusterSize(1000);
+    ec.setMinClusterSize(segmentValidPointNum);
+    ec.setSearchMethod(tree_ec);
+    ec.extract(cluster_indices);
+
+    for (size_t i = 0; i < cluster_indices.size(); ++i)
+    {
+      ++objectCount;
+      pcl::PointIndicesPtr inlier_(new pcl::PointIndices(cluster_indices[i]));
+      for (size_t j = 0; j < inlier_->indices.size(); ++j)
+      {
+        size_t index = inlier_->indices[j];
+        segmentedCloudPure->push_back(laserCloudIn->points[index]);
+        segmentedCloudPure->points.back().intensity = objectCount;
+      }
+    }
+    ROS_INFO("\033[1;32m--Euclidean-->\033[0m ojbects = %ld, total size = %ld", objectCount,
+             segmentedCloudPure->points.size());
+  }
+
   /**
    * 根据论文<Fast  Range  Image-Based  Segmentationof  Sparse  3D  Laser  Scans  for  Online  Operation>
-   * 通过计算两点之间的角度来判断是否是同一目标
+   * 通过计算同一行或者列相邻两点之间的角度(或者距离)来判断是否是同一目标
+   * 1.当相邻列属于缺失点时,与纯欧式聚类相比,会出现同一物体被划分为多个物体,例如汽车上部分
    * */
   void cloudSegmentation()
   {
     // segmentation process
     for (size_t i = 0; i < N_SCAN; ++i)
       for (size_t j = 0; j < Horizon_SCAN; ++j)
-        if (objectMat.at<int>(i, j) == 0)  // 有效点
+        if (objectMat.at<int>(i, j) == 0) // 有效点
         {
-          labelComponents(i, j);  // ToDo 仔细检查,不行重写
+          labelComponents(i, j); // ToDo 仔细检查,不行重写
         }
 
-    int sizeOfSegCloud = 0;  // 目标物个数
+    int sizeOfSegCloud = 0; // 目标物个数
     // // extract segmented cloud for lidar odometry
     // for (size_t i = 0; i < N_SCAN; ++i)
     // {
@@ -482,8 +637,8 @@ public:
           }
         }
       }
-      ROS_INFO("\033[1;32m---->\033[0m ojbects = %ld, total size = %ld", object_count_,
-               segmentedCloudPure->points.size());
+      // ROS_INFO("\033[1;32m---->\033[0m ojbects = %ld, total size = %ld", object_count_,
+      //          segmentedCloudPure->points.size());
     }
   }
 
@@ -492,7 +647,7 @@ public:
     // use std::queue std::vector std::deque will slow the program down greatly
     float d1, d2, alpha, angle, distance;
     int fromIndX, fromIndY, thisIndX, thisIndY;
-    bool lineCountFlag[N_SCAN] = { false };
+    bool lineCountFlag[N_SCAN] = {false};
 
     queueIndX[0] = row;
     queueIndY[0] = col;
@@ -544,7 +699,7 @@ public:
         angle = atan2(d2 * sin(alpha), (d1 - d2 * cos(alpha)));
         distance = sqrt(pow(d2 * sin(alpha), 2) + pow(d1 - d2 * cos(alpha), 2));
 
-        if (angle > segmentTheta || distance < segmentDistance)  // 角度够大,或者距离够近
+        if (angle > segmentTheta || distance < segmentDistance) // 角度够大,或者距离够近
         {
           queueIndX[queueEndInd] = thisIndX;
           queueIndY[queueEndInd] = thisIndY;
@@ -581,7 +736,7 @@ public:
       // ROS_INFO("\033[1;32m Get a Object.\033[0m");
     }
     else
-    {  // segment is invalid, mark these points
+    { // segment is invalid, mark these points
       for (size_t i = 0; i < allPushedIndSize; ++i)
       {
         objectMat.at<int>(allPushedIndX[i], allPushedIndY[i]) = 999999;
